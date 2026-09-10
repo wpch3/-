@@ -1,0 +1,21 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "D": {
+      "item": "projecte:dm_leggings"
+    },
+    "M": {
+      "item": "projecte:red_matter"
+    }
+  },
+  "pattern": [
+    "MMM",
+    "MDM",
+    "M M"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:rm_leggings"
+  }
+}

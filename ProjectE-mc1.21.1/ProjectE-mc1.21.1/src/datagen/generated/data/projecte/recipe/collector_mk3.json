@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "G": {
+      "item": "minecraft:glowstone"
+    },
+    "P": {
+      "item": "projecte:collector_mk2"
+    },
+    "U": {
+      "item": "projecte:red_matter"
+    }
+  },
+  "pattern": [
+    "GUG",
+    "GPG",
+    "GGG"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:collector_mk3"
+  }
+}

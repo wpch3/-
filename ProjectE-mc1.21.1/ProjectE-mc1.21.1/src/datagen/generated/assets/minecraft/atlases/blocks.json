@@ -1,0 +1,12 @@
+{
+  "sources": [
+    {
+      "type": "minecraft:single",
+      "resource": "projecte:curios/empty_klein_star"
+    },
+    {
+      "type": "minecraft:single",
+      "resource": "projecte:curios/transmutation_tablet"
+    }
+  ]
+}

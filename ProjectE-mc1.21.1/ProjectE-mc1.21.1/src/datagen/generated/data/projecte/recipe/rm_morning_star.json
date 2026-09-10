@@ -1,0 +1,27 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "1": {
+      "item": "projecte:rm_hammer"
+    },
+    "2": {
+      "item": "projecte:rm_pick"
+    },
+    "3": {
+      "item": "projecte:rm_shovel"
+    },
+    "R": {
+      "item": "projecte:red_matter"
+    }
+  },
+  "pattern": [
+    "123",
+    "RRR",
+    "RRR"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:rm_morning_star"
+  }
+}

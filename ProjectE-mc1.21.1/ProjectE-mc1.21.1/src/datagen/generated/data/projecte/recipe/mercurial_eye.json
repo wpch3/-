@@ -1,0 +1,27 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "B": {
+      "item": "minecraft:bricks"
+    },
+    "D": {
+      "tag": "c:gems/diamond"
+    },
+    "O": {
+      "tag": "c:obsidians/normal"
+    },
+    "R": {
+      "item": "projecte:red_matter"
+    }
+  },
+  "pattern": [
+    "OBO",
+    "BRB",
+    "BDB"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:mercurial_eye"
+  }
+}

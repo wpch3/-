@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "M": {
+      "item": "projecte:dark_matter"
+    },
+    "R": {
+      "item": "projecte:red_matter"
+    },
+    "S": {
+      "item": "projecte:dm_shovel"
+    }
+  },
+  "pattern": [
+    "R",
+    "S",
+    "M"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:rm_shovel"
+  }
+}

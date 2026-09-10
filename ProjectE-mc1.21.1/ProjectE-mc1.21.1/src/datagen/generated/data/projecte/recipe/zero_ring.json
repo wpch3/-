@@ -1,0 +1,27 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "B": {
+      "item": "minecraft:snowball"
+    },
+    "I": {
+      "item": "projecte:iron_band"
+    },
+    "M": {
+      "item": "projecte:dark_matter"
+    },
+    "S": {
+      "item": "minecraft:snow_block"
+    }
+  },
+  "pattern": [
+    "SBS",
+    "MIM",
+    "SBS"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:zero_ring"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    {
+      "item": "minecraft:charcoal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    },
+    {
+      "tag": "c:cobblestones/normal"
+    }
+  ],
+  "result": {
+    "count": 40,
+    "id": "projecte:low_covalence_dust"
+  }
+}

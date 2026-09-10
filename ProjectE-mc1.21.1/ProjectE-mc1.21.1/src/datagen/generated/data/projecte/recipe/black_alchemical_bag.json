@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "A": {
+      "item": "projecte:alchemical_chest"
+    },
+    "C": {
+      "item": "projecte:high_covalence_dust"
+    },
+    "W": {
+      "item": "minecraft:black_wool"
+    }
+  },
+  "pattern": [
+    "CCC",
+    "WAW",
+    "WWW"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:black_alchemical_bag"
+  }
+}

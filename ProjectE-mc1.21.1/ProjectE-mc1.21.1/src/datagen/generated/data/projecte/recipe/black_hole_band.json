@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "D": {
+      "item": "projecte:dark_matter"
+    },
+    "I": {
+      "item": "projecte:iron_band"
+    },
+    "S": {
+      "tag": "c:strings"
+    }
+  },
+  "pattern": [
+    "SSS",
+    "DID",
+    "SSS"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:black_hole_band"
+  }
+}

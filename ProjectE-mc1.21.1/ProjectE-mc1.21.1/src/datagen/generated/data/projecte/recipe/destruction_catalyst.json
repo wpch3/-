@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "F": {
+      "item": "minecraft:flint_and_steel"
+    },
+    "M": {
+      "item": "projecte:mobius_fuel"
+    },
+    "N": {
+      "item": "projecte:nova_catalyst"
+    }
+  },
+  "pattern": [
+    "NMN",
+    "MFM",
+    "NMN"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:destruction_catalyst"
+  }
+}

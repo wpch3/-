@@ -1,0 +1,26 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "I": {
+      "tag": "c:ingots/iron"
+    },
+    "L": [
+      {
+        "item": "minecraft:lava_bucket"
+      },
+      {
+        "item": "projecte:volcanite_amulet"
+      }
+    ]
+  },
+  "pattern": [
+    "III",
+    "ILI",
+    "III"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:iron_band"
+  }
+}

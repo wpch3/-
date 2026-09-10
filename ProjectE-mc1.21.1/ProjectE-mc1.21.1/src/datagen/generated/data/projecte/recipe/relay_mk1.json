@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "D": {
+      "tag": "c:storage_blocks/diamond"
+    },
+    "O": {
+      "tag": "c:obsidians/normal"
+    },
+    "S": {
+      "item": "minecraft:glass"
+    }
+  },
+  "pattern": [
+    "OSO",
+    "ODO",
+    "OOO"
+  ],
+  "result": {
+    "count": 1,
+    "id": "projecte:relay_mk1"
+  }
+}

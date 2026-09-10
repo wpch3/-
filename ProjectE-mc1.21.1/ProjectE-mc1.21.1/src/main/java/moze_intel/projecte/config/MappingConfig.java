@@ -10,6 +10,7 @@ import moze_intel.projecte.api.mapper.IEMCMapper;
 import moze_intel.projecte.api.nss.NormalizedSimpleStack;
 import moze_intel.projecte.api.proxy.IEMCProxy;
 import moze_intel.projecte.config.value.CachedBooleanValue;
+import moze_intel.projecte.config.value.CachedIntValue;
 import net.neoforged.fml.config.ModConfig.Type;
 import net.neoforged.neoforge.common.ModConfigSpec;
 import org.jetbrains.annotations.NotNull;
@@ -38,6 +39,9 @@ public class MappingConfig extends BasePEConfig {
 	public final CachedBooleanValue dumpToFile;
 	public final CachedBooleanValue usePregenerated;
 	public final CachedBooleanValue logExploits;
+	/** Assigns an EMC floor to every registered item that no mapper could value. */
+	public final CachedBooleanValue mapAllItems;
+	public final CachedIntValue unmappedItemEmc;
 
 	private final ModConfigSpec configSpec;
 	private final Map<String, BooleanSupplier> mappersEnabledConfig;
@@ -49,6 +53,12 @@ public class MappingConfig extends BasePEConfig {
 		dumpToFile = CachedBooleanValue.wrap(this, PEConfigTranslations.MAPPING_DUMP_TO_FILE.applyToBuilder(builder).define("dumpToFile", false));
 		usePregenerated = CachedBooleanValue.wrap(this, PEConfigTranslations.MAPPING_PREGENERATED.applyToBuilder(builder).define("usePregenerated", false));
 		logExploits = CachedBooleanValue.wrap(this, PEConfigTranslations.MAPPING_LOG_EXPLOITS.applyToBuilder(builder).define("logFoundExploits", true));
+		mapAllItems = CachedBooleanValue.wrap(this, builder
+				.comment("Give every registered non-air item an EMC value when recipes and integrations cannot determine one. This includes modded drops without recipes.")
+				.define("mapAllItems", true));
+		unmappedItemEmc = CachedIntValue.wrap(this, builder
+				.comment("Fallback EMC assigned only to otherwise unmapped items. Existing calculated or custom EMC is never overwritten.")
+				.defineInRange("unmappedItemEmc", 1, 1, Integer.MAX_VALUE));
 
 		PEConfigTranslations.MAPPING_MAPPERS.applyToBuilder(builder).push("mappers");
 		mappersEnabledConfig = new HashMap<>(mappers.size());
@@ -85,6 +95,14 @@ public class MappingConfig extends BasePEConfig {
 
 	public static boolean logExploits() {
 		return INSTANCE == null || INSTANCE.logExploits.get();
+	}
+
+	public static boolean mapAllItems() {
+		return INSTANCE == null || INSTANCE.mapAllItems.get();
+	}
+
+	public static int unmappedItemEmc() {
+		return INSTANCE == null ? 1 : INSTANCE.unmappedItemEmc.get();
 	}
 
 	/**

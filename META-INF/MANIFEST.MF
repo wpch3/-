@@ -1,0 +1,11 @@
+Manifest-Version: 1.0
+Specification-Title: ProjectE
+Specification-Vendor: ProjectE
+Specification-Version: 1.1.0
+Implementation-Title: ProjectE
+Implementation-Version: 1.1.0
+Implementation-Vendor: ProjectE
+Implementation-Timestamp: 2025-06-03T18:37:50-0400
+Automatic-Module-Name: projecte
+Class-Path: commons-math3-3.6.1.jar
+

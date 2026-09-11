@@ -1,4 +1,3 @@
-
-plugins {
-    id('org.gradle.toolchains.foojay-resolver-convention') version('0.9.0')
-}
+// The build uses the locally configured Java 21 toolchain. Avoid the optional
+// Foojay resolver plugin so builds do not depend on plugins-artifacts.gradle.org
+// merely to discover a JDK that is already installed.

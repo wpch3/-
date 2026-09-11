@@ -222,6 +222,10 @@ static void exclusiveRepo(RepositoryHandler handler, String url, Consumer<Inclus
 }
 
 repositories { RepositoryHandler handler ->
+    // commons-math3 is shaded into ProjectE. Resolve it exclusively from Maven
+    // Central instead of relying on NeoForge's repository proxy, which is prone
+    // to connection resets and does not own this artifact.
+    exclusiveRepo(handler, 'https://repo.maven.apache.org/maven2', 'org.apache.commons', 'org.apache')
     exclusiveRepo(handler, 'https://maven.blamejared.com', filter -> {
         filter.includeGroupAndSubgroups('com.blamejared')
         filter.includeGroup('mezz.jei')

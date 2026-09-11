@@ -35,6 +35,7 @@ import moze_intel.projecte.impl.capability.KnowledgeImpl;
 import moze_intel.projecte.network.packets.to_client.SyncEmcPKT;
 import moze_intel.projecte.utils.AnnotationHelper;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.ReloadableServerResources;
 import net.minecraft.server.level.ServerPlayer;
@@ -82,7 +83,7 @@ public final class EMCMappingHandler {
 		Path pregeneratedEmcFile = ProjectEConfig.CONFIG_DIR.resolve("pregenerated_emc.json");
 		Optional<Object2LongMap<ItemInfo>> readPregeneratedValues = PregeneratedEMC.read(registryAccess, pregeneratedEmcFile, usePregenerated);
 		if (readPregeneratedValues.isPresent()) {
-			int values = updateEmcValues(readPregeneratedValues.get());
+			int values = updateEmcValues(addFallbackValues(readPregeneratedValues.get()));
 			PECore.debugLog("Loaded {} values from pregenerated EMC File", values);
 		} else {
 			SimpleGraphMapper.setLogFoundExploits(MappingConfig.logExploits());
@@ -109,7 +110,7 @@ public final class EMCMappingHandler {
 			Object2LongMap<NormalizedSimpleStack> graphMapperValues = valueGenerator.generateValues();
 			PECore.debugLog("Generated Values...");
 
-			updateEmcValues(filterEMCMap(graphMapperValues));
+			updateEmcValues(addFallbackValues(filterEMCMap(graphMapperValues)));
 			PECore.debugLog("Filtered Values...");
 
 			if (usePregenerated && emc != null) {//Note: It should never be null here as we just set it
@@ -162,6 +163,28 @@ public final class EMCMappingHandler {
 			}
 		}
 		return resultMap;
+	}
+
+	/**
+	 * Completes the map with all registered item types. Recipe/custom values always win;
+	 * the fallback exists specifically for loot, quest rewards and machine outputs that
+	 * expose no recipe to ProjectE. AIR is the sole intentional exclusion because it is
+	 * Minecraft's empty-stack sentinel and cannot be inserted into the table.
+	 */
+	private static Object2LongMap<ItemInfo> addFallbackValues(Object2LongMap<ItemInfo> mappedValues) {
+		if (!MappingConfig.mapAllItems()) {
+			return mappedValues;
+		}
+		Object2LongMap<ItemInfo> completed = new Object2LongOpenHashMap<>(mappedValues);
+		long fallback = MappingConfig.unmappedItemEmc();
+		int added = 0;
+		for (var item : BuiltInRegistries.ITEM) {
+			if (item != net.minecraft.world.item.Items.AIR && completed.putIfAbsent(ItemInfo.fromItem(item), fallback) == 0) {
+				added++;
+			}
+		}
+		PECore.LOGGER.info("Universal EMC fallback mapped {} previously unmapped registered items at {} EMC", added, fallback);
+		return completed;
 	}
 
 	public static int getEmcMapSize() {

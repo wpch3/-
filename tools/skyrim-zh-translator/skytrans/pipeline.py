@@ -1,20 +1,21 @@
-"""主流水线：抽取 -> 去重 -> 翻译 -> 回写 -> 报告。"""
+"""主流水线：抽取 -> 词典/缓存命中 -> 翻译 -> 回写 -> 报告。"""
 
 from __future__ import annotations
 
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import esp
 from .cache import Cache
-from .fields import NEVER_TRANSLATE, translatable_sigs
+from .fields import NEVER_TRANSLATE, translate_field
 from .mcm import McmFile
 from .providers import Provider, ProviderError
-from .scan import Pack, PluginInfo, TableRef
+from .scan import Pack, PluginInfo
 from .strings import StringTable
 from .textfilter import (
     Glossary,
@@ -24,9 +25,10 @@ from .textfilter import (
     is_translated,
     split_text,
 )
+from .tm import TranslationMemory
 
 LETTERS = re.compile(r"[A-Za-z\u00c0-\u024f]")
-PATHLIKE = re.compile(r"^[\w\-.\\/ ]+\.(nif|dds|wav|xwm|fuz|hkx|pex|esp|esm|esl|bsa|kf|png|tga)$", re.I)
+TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 @dataclass
@@ -44,7 +46,9 @@ class Options:
     only: List[str] = field(default_factory=list)
     exclude: List[str] = field(default_factory=list)
     export_review: bool = True
-    keep_english_suffix: bool = True
+    workers: int = 1
+    fuzzy: float = 0.0
+    meta_ini: bool = True
 
 
 @dataclass
@@ -54,6 +58,9 @@ class Unit:
     apply: Callable[[str], None]
     source: str
     kind: str
+    rec_sig: str = ""
+    sub_sig: str = ""
+    edid: str = ""
 
 
 @dataclass
@@ -70,7 +77,7 @@ class Plan:
     mcm_files: List[McmFile] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    skipped_examples: List[Tuple[str, str]] = field(default_factory=list)
+    applied: List[Tuple[Unit, str, str]] = field(default_factory=list)
 
 
 def looks_like_text(text: str) -> bool:
@@ -84,9 +91,6 @@ def looks_like_text(text: str) -> bool:
     return letters / max(1, len(text)) >= 0.35
 
 
-TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-
-
 class Translator:
     def __init__(
         self,
@@ -95,6 +99,7 @@ class Translator:
         cache: Optional[Cache] = None,
         provider: Optional[Provider] = None,
         glossary: Optional[Glossary] = None,
+        tm: Optional[TranslationMemory] = None,
         log=print,
     ) -> None:
         self.pack = pack
@@ -102,9 +107,14 @@ class Translator:
         self.cache = cache
         self.provider = provider
         self.glossary = glossary
+        self.tm = tm
         self.log = log
         self.failures: List[Tuple[str, str]] = []
         self.soft_drops = 0
+        self.tm_hits = 0
+        self.cache_hits = 0
+        self._last_progress_time = 0.0
+        self._last_progress_percent = -100.0
 
     # ------------------------------------------------------------------
     # 1. 抽取
@@ -138,7 +148,7 @@ class Translator:
         plan.stats = stats
         return plan
 
-    def _unit_ok(self, text: str, plan: Plan, source: str) -> bool:
+    def _unit_ok(self, text: str, plan: Plan) -> bool:
         if is_translated(text):
             plan.stats["already_zh"] = plan.stats.get("already_zh", 0) + 1
             return False
@@ -171,7 +181,7 @@ class Translator:
                 )
             for index in range(len(table.entries)):
                 text = table.text(index)
-                if not self._unit_ok(text, plan, ref.name):
+                if not self._unit_ok(text, plan):
                     continue
                 plan.units.append(
                     Unit(
@@ -180,9 +190,9 @@ class Translator:
                         apply=lambda value, t=table, i=index: t.set_text(i, value),
                         source=plugin.name,
                         kind="stringtable",
+                        sub_sig=ref.kind,
                     )
                 )
-            # 表对象与来源绑定，便于写出时确定文件名
             table.path = ref.path or Path(ref.name)
 
     def _collect_inline(self, plugin: PluginInfo, plan: Plan) -> None:
@@ -190,31 +200,37 @@ class Translator:
         plan.plugins[plugin.base] = loaded
         count = 0
         for record in loaded.iter_records():
-            allowed = translatable_sigs(record.sig)
             rec_sig = record.sig.decode("latin-1")
-            for index, sub in enumerate(record.subs):
-                if sub.sig in NEVER_TRANSLATE and sub.sig.decode("latin-1") not in allowed:
+            edid = ""
+            edid_sub = record.get(b"EDID")
+            if edid_sub is not None:
+                edid = edid_sub.text
+            for sub in record.subs:
+                if sub.sig in NEVER_TRANSLATE:
                     continue
-                if sub.sig.decode("latin-1") not in allowed:
+                if not translate_field(rec_sig, sub.sig):
                     continue
-                text = sub.text
-                if rec_sig == "GMST" and sub.sig == b"DATA":
+                sub_sig = sub.sig.decode("latin-1")
+                if rec_sig == "GMST" and sub_sig == "DATA":
                     # 只有字符串型 GMST 才翻（数值型 DATA 固定 4 字节）
                     if len(sub.data) <= 4:
                         continue
+                text = sub.text
                 if not looks_like_text(text):
                     plan.stats["not_text"] = plan.stats.get("not_text", 0) + 1
                     continue
-                if not self._unit_ok(text, plan, plugin.name):
+                if not self._unit_ok(text, plan):
                     continue
                 plan.units.append(
                     Unit(
-                        uid="%s|%08X|%s|%d"
-                        % (plugin.base, record.formid, sub.sig.decode("latin-1"), index),
+                        uid="%s|%08X|%s" % (plugin.base, record.formid, sub_sig),
                         text=text,
                         apply=sub.set_text,
                         source=plugin.name,
                         kind="plugin",
+                        rec_sig=rec_sig,
+                        sub_sig=sub_sig,
+                        edid=edid,
                     )
                 )
                 count += 1
@@ -240,7 +256,7 @@ class Translator:
             plan.stats["mcm_files"] = plan.stats.get("mcm_files", 0) + 1
             for index in range(len(mcm.keys)):
                 text = mcm.text(index)
-                if not self._unit_ok(text, plan, name):
+                if not self._unit_ok(text, plan):
                     continue
                 plan.units.append(
                     Unit(
@@ -267,7 +283,6 @@ class Translator:
             return
         opts = self.options
 
-        # 2.1 切分
         pieces_per_unit: List[List[Piece]] = []
         vocabulary: Dict[str, None] = {}
         for unit in plan.units:
@@ -290,27 +305,48 @@ class Translator:
             )
         )
 
-        limit = opts.limit
-        if limit and len(unique) > limit:
-            unique = unique[:limit]
-            self.log("试跑模式：只翻译前 %d 个片段" % limit)
+        if opts.limit and len(unique) > opts.limit:
+            unique = unique[: opts.limit]
+            self.log("试跑模式：只翻译前 %d 个片段" % opts.limit)
 
-        # 2.2 缓存
         translations: Dict[str, str] = {}
+        from_memory = set()  # 来自缓存/词典、本次没有真正翻译的条目
+
+        # 2.1 先查上次的缓存（同一引擎的历史结果优先，人工校对也走这里）
         if self.cache is not None:
             translations.update(self.cache.get_many([self.cache.namespace], unique))
-        cached_hits = len(translations)
-        if cached_hits:
-            self.log("缓存命中 %d 条，可省去重复计费" % cached_hits)
+            self.cache_hits = len(translations)
+            from_memory.update(translations)
+            if self.cache_hits:
+                self.log("缓存命中 %d 条（不用重新翻、也不用花钱）" % self.cache_hits)
+
+        # 2.2 再查词典（xTranslator SST / ESP-ESM BDD 那套：翻过的不再翻）
+        if self.tm is not None:
+            for text in unique:
+                if text in translations:
+                    continue
+                hit, how = self.tm.lookup_smart(text, opts.fuzzy)
+                if hit is not None and hit != text:
+                    translations[text] = hit
+                    from_memory.add(text)
+                    self.tm_hits += 1
+            if self.tm_hits:
+                self.log("词典命中 %d 条（精确/归一化/模糊）" % self.tm_hits)
 
         pending = [t for t in unique if t not in translations]
+        plan.stats["cache_hits"] = self.cache_hits
+        plan.stats["tm_hits"] = self.tm_hits
+        plan.stats["api_items"] = len(pending)
+        self.log(
+            "需要调用接口：%d 条 / %d 字符"
+            % (len(pending), sum(len(t) for t in pending))
+        )
 
         if opts.dry_run or self.provider is None or self.provider.name == "none":
             self.log("扫描/试跑模式：不调用翻译接口，仅生成清单与统计。")
             self._apply(plan, pieces_per_unit, translations)
             return
 
-        # 2.3 保护占位符 + 分批
         protectors: Dict[str, Protector] = {}
         protected: Dict[str, str] = {}
         for text in pending:
@@ -320,35 +356,65 @@ class Translator:
 
         batches = self._make_batches(pending, protected)
         started = time.time()
-        done_chars = 0
-        done_items = 0
-        total_items = len(pending)
         total_pending_chars = sum(len(t) for t in pending)
+        done_items = 0
+        done_chars = 0
+        batch_chars = [sum(len(t) for t in b) for b in batches]
 
-        for batch in batches:
-            result = self._translate_resilient(batch, protected)
+        def absorb(result: Dict[str, str], size: int, chars: int) -> None:
+            nonlocal done_items, done_chars
             for src, dst in result.items():
                 final = self._finalize(src, dst, protectors[src])
                 if final is None:
                     self.failures.append((src, "译文疑似无效（无中文或占位符丢失）"))
                     continue
                 translations[src] = final
-            done_items += len(batch)
-            done_chars += sum(len(t) for t in batch)
             if self.cache is not None:
                 self.cache.put_many(
                     self.cache.namespace,
-                    [(src, translations[src]) for src in batch if src in translations],
+                    [(src, translations[src]) for src in result if src in translations],
                 )
-            self._progress(done_items, total_items, done_chars, total_pending_chars, started)
+            done_items += size
+            done_chars += chars
+            self._progress(done_items, len(pending), done_chars, total_pending_chars, started)
 
-        if total_items:
+        workers = max(1, int(opts.workers or 1))
+        if workers > 1 and len(batches) > 1:
+            self.log("并发请求：%d 线程" % workers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._translate_resilient, batch, protected): idx
+                    for idx, batch in enumerate(batches)
+                }
+                for future, idx in futures.items():
+                    result = future.result()
+                    absorb(result, len(batches[idx]), batch_chars[idx])
+        else:
+            for idx, batch in enumerate(batches):
+                result = self._translate_resilient(batch, protected)
+                absorb(result, len(batch), batch_chars[idx])
+
+        if pending:
             self.log("")
             elapsed = time.time() - started
             self.log(
                 "翻译完成：%d 条，用时 %.1f 分钟，接口调用 %d 次"
-                % (done_items, elapsed / 60, self.provider.calls if self.provider else 0)
+                % (len(pending), elapsed / 60, self.provider.calls if self.provider else 0)
             )
+
+        # 2.4 学习：把本次结果写进词典，下次（或别的 mod）直接复用
+        if self.tm is not None:
+            learned = self.tm.add_pairs(
+                [
+                    (src, dst)
+                    for src, dst in translations.items()
+                    if src != dst and src not in from_memory
+                ],
+                "run",
+            )
+            if learned:
+                self.log("已向词典补充 %d 条" % learned)
+
         self._apply(plan, pieces_per_unit, translations)
 
     def _translate_resilient(
@@ -426,11 +492,12 @@ class Translator:
             sys.stderr.write("\r" + msg)
             sys.stderr.flush()
             return
-        # 非交互环境（重定向到文件、CI）不要刷几千行，10 秒或 10% 打一次
         now = time.time()
-        last_time = getattr(self, "_last_progress_time", 0.0)
-        last_percent = getattr(self, "_last_progress_percent", -100.0)
-        if now - last_time >= 10 or percent - last_percent >= 10 or done_items == total_items:
+        if (
+            now - self._last_progress_time >= 10
+            or percent - self._last_progress_percent >= 10
+            or done_items >= total_items
+        ):
             self._last_progress_time = now
             self._last_progress_percent = percent
             self.log(msg)
@@ -453,6 +520,7 @@ class Translator:
                 continue
             if value and value != unit.text:
                 unit.apply(value)
+                plan.applied.append((unit, unit.text, value))
                 applied += 1
         plan.stats["applied"] = applied
         plan.stats["unchanged"] = unchanged
@@ -468,7 +536,6 @@ class Translator:
 
         plugin_by_base = {p.base: p for p in self.pack.plugins}
 
-        # 3.1 内嵌字符串插件
         for base, plugin in plan.plugins.items():
             if not plugin.dirty:
                 continue
@@ -484,7 +551,6 @@ class Translator:
             written["plugins"] += 1
             self._log_write("插件", target, written["plugins"])
 
-        # 3.2 字符串表
         for key, table in plan.tables.items():
             if not table.dirty:
                 continue
@@ -501,7 +567,6 @@ class Translator:
             written["tables"] += 1
             self._log_write("字符串表", target, written["tables"])
 
-        # 3.3 MCM
         for mcm in plan.mcm_files:
             if not mcm.dirty:
                 continue
@@ -517,17 +582,18 @@ class Translator:
 
         if not opts.in_place:
             self._write_readme(out, written)
+            if opts.meta_ini:
+                self._write_meta(out)
         return written
 
     def _log_write(self, kind: str, target: Path, count: int) -> None:
-        """别把 500 个文件刷满屏幕：每类只列前 6 个。"""
         if count <= 6:
-            self.log("  写出%s: %s" % (kind, target))
+            self.log("  写出 %s: %s" % (kind, target))
         elif count == 7:
-            self.log("  写出%s: ……（完整列表见汉化报告）" % kind)
+            self.log("  写出 %s: ……（完整列表见汉化报告）" % kind)
 
     def _renamed_table(self, name: str) -> str:
-        suffix = Path(name).suffix  # 保留大小写，如 .STRINGS
+        suffix = Path(name).suffix
         stem = Path(name).stem
         if "_" not in stem:
             return name
@@ -546,6 +612,21 @@ class Translator:
             bak = path.with_suffix(path.suffix + ".orig")
             if not bak.exists():
                 bak.write_bytes(path.read_bytes())
+
+    def _write_meta(self, out: Path) -> None:
+        """MO2 的 meta.ini，让汉化包在 MO2 里显示正常（而不是「未识别 mod」）。"""
+        meta = (
+            "[General]\n"
+            "gameName=skyrimspecialedition\n"
+            "modid=0\n"
+            "version=1.0\n"
+            "category=0,汉化\n"
+            "comments=由 skyrim-zh-translator 生成\n"
+        )
+        try:
+            (out / "meta.ini").write_text(meta, encoding="utf-8")
+        except OSError:
+            pass
 
     def _write_readme(self, out: Path, written: Dict[str, int]) -> None:
         out.mkdir(parents=True, exist_ok=True)
@@ -582,10 +663,14 @@ README_TEMPLATE = """天际模组汉化包（由 skyrim-zh-translator 生成）
 """
 
 
-# ----------------------------------------------------------------------
-# 报告
-# ----------------------------------------------------------------------
-def write_report(plan: Plan, provider_name: str, path: Path, failures, warnings) -> None:
+def write_report(
+    plan: Plan,
+    provider_name: str,
+    path: Path,
+    failures,
+    warnings,
+    tm_stats: Optional[Dict[str, int]] = None,
+) -> None:
     s = plan.stats
     lines = [
         "# 汉化报告",
@@ -598,12 +683,19 @@ def write_report(plan: Plan, provider_name: str, path: Path, failures, warnings)
             s.get("inline_plugins", 0),
         ),
         "- 抽取到可翻译文本：%d 条" % s.get("units", 0),
-        "- 去重后实际送翻：%d 条 / %d 字符" % (s.get("unique_pieces", 0), s.get("chars", 0)),
+        "- 去重后唯一片段：%d 条 / %d 字符" % (s.get("unique_pieces", 0), s.get("chars", 0)),
+        "- 词典命中：%d 条；缓存命中：%d 条；实际调用接口：%d 条"
+        % (s.get("tm_hits", 0), s.get("cache_hits", 0), s.get("api_items", 0)),
         "- 已写回：%d 条；保留原文：%d 条" % (s.get("applied", 0), s.get("unchanged", 0)),
         "- 判定已是中文而跳过：%d 条" % s.get("already_zh", 0),
         "- 判定非文本而跳过：%d 条" % s.get("not_text", 0),
         "",
     ]
+    if tm_stats:
+        lines += [
+            "- 词典条目总数：%d" % tm_stats.get("entries", 0),
+            "",
+        ]
     if failures:
         lines += ["## 失败条目（%d）" % len(failures), ""]
         for text, reason in failures[:50]:

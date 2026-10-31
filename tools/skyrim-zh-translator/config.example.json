@@ -8,6 +8,9 @@
 
   "batch_chars": 2400,
   "batch_items": 30,
+  "workers": 4,
+  "fuzzy": 0.0,
   "output_lang": "english",
-  "export_review": true
+  "export_review": true,
+  "tm_from": ""
 }

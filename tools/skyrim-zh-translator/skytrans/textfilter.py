@@ -76,6 +76,14 @@ def is_translatable(text: str, min_chars: int = 2) -> bool:
     return True
 
 
+def token_signature(text: str) -> tuple:
+    """返回文本里所有需要原样保留的记号（排序后），用于词典匹配时的一致性校验。"""
+    tokens = []
+    for pattern, _hard in PROTECT_PATTERNS:
+        tokens.extend(match.group(0) for match in pattern.finditer(text))
+    return tuple(sorted(tokens))
+
+
 class Protector:
     """把占位符换成 ⟦n⟧，翻译后再换回来。"""
 

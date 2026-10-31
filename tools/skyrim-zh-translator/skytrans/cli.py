@@ -12,10 +12,13 @@ from typing import Dict, List, Optional, Tuple
 
 from .cache import Cache
 from .mcm import McmFile
+from .qa import check_plan, summarize as summarize_qa, write_report as write_qa_report, write_csv as write_qa_csv
 from .pipeline import Options, Translator, write_report
 from .providers import Provider, build_provider
 from .scan import scan_pack
 from .textfilter import Glossary
+from .tm import TranslationMemory, collect_chinese_tables
+from .strings import StringTable
 
 HERE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = HERE / "config.json"
@@ -76,10 +79,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--piece-chars", type=int, default=1500, help="长文本切分长度")
     p.add_argument("--export-review", nargs="?", const="", default=None,
                    help="导出人工校对 CSV（可指定路径）")
+    # ---- 词典（翻译记忆）----
+    p.add_argument("--tm", default=None, help="词典数据库路径（默认 <输出>/tm.sqlite）")
+    p.add_argument("--no-tm", action="store_true", help="不使用词典")
+    p.add_argument("--tm-import", action="append", default=None, metavar="FILE",
+                   help="导入 TSV/CSV 词典（英文<TAB>中文），可多次")
+    p.add_argument("--tm-from", default=None, metavar="DIR",
+                   help="从现成汉化目录导入：*_chinese.STRINGS 与原文按 ID 配对")
+    p.add_argument("--tm-pair", nargs=2, action="append", default=None,
+                   metavar=("EN", "ZH"), help="英文插件 + 已汉化插件，按 FormID 配对")
+    p.add_argument("--tm-export", default=None, metavar="FILE", help="导出词典 TSV")
+    p.add_argument("--fuzzy", type=float, default=None,
+                   help="模糊匹配阈值（0=关闭，建议 0.92~0.95）")
+    p.add_argument("--workers", type=int, default=None, help="并发请求线程数（默认 1，建议 4~8）")
+    p.add_argument("--no-check", action="store_true", help="跳过质检")
     p.add_argument("--import-review", default=None, help="导入校对后的 CSV")
     p.add_argument("--wizard", action="store_true", help="强制进入交互向导")
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
-    p.add_argument("--version", action="version", version="skytrans 1.0")
+    p.add_argument("--version", action="version", version="skytrans 1.1")
     return p
 
 
@@ -199,6 +216,9 @@ def wizard(config: Dict) -> Dict:
         config["provider"] = "mock"
 
     print()
+    tm_from = ask("有现成汉化/词典可以复用吗？（目录或 TSV，回车跳过）", "")
+    if tm_from:
+        config["tm_from"] = tm_from.strip('"').strip("'")
     review = ask("是否导出「人工校对表」CSV？(y/n)", "y")
     config["export_review"] = review.lower().startswith("y")
     config["output_lang"] = ask("字符串表后缀（保持不变就是 english）", "english")
@@ -272,6 +292,8 @@ def run(argv: Optional[List[str]] = None) -> int:
         exclude=_split(args.exclude),
         export_review=bool(args.export_review) if args.export_review is not None
         else bool(config.get("export_review", True)),
+        workers=int(args.workers if args.workers is not None else config.get("workers", 1)),
+        fuzzy=float(args.fuzzy if args.fuzzy is not None else config.get("fuzzy", 0.0)),
     )
 
     glossary = None
@@ -292,10 +314,10 @@ def run(argv: Optional[List[str]] = None) -> int:
         glossary_digest(glossary),
         opts.output_lang,
     )
-    cache = Cache(cache_path, namespace)
+    cache = None if args.scan_only else Cache(cache_path, namespace)
 
     # 校对回填
-    if args.import_review:
+    if args.import_review and cache is not None:
         n = cache.import_csv(Path(args.import_review))
         print("已从 %s 导入 %d 条人工译文" % (args.import_review, n))
 
@@ -305,7 +327,19 @@ def run(argv: Optional[List[str]] = None) -> int:
         for warning in pack.warnings[:20]:
             print("  提示：%s" % warning)
 
-    translator = Translator(pack, opts, cache=cache, provider=provider, glossary=glossary)
+    tm = None
+    if not args.no_tm and not args.scan_only:
+        tm_path = Path(args.tm) if args.tm else out / "tm.sqlite"
+        try:
+            tm = TranslationMemory(tm_path)
+            _import_memory(tm, args, pack, config, out)
+        except Exception as exc:  # noqa: BLE001
+            print("词典初始化失败（本次不使用词典）：%s" % exc)
+            tm = None
+
+    translator = Translator(
+        pack, opts, cache=cache, provider=provider, glossary=glossary, tm=tm
+    )
     plan = translator.build_plan()
     plan.stats["localized_plugins"] = sum(1 for p in pack.plugins if p.localized)
     plan.stats["inline_plugins"] = sum(1 for p in pack.plugins if not p.localized)
@@ -335,7 +369,28 @@ def run(argv: Optional[List[str]] = None) -> int:
         print("已导出校对表：%s（%d 条，改完可用 --import-review 回填）" % (path, n))
 
     report_path = out / "汉化报告.md"
-    write_report(plan, provider.describe(), report_path, translator.failures, pack.warnings + plan.warnings)
+    write_report(
+        plan,
+        provider.describe(),
+        report_path,
+        translator.failures,
+        pack.warnings + plan.warnings,
+        tm.stats() if tm is not None else None,
+    )
+
+    issues = []
+    if not args.no_check:
+        issues = check_plan(plan)
+        qa_path = out / "质检报告.md"
+        write_qa_report(issues, qa_path, plan.stats)
+        write_qa_csv(issues, out / "质检.csv")
+        flags = summarize_qa(issues)
+        print("质检：错误 %d / 警告 %d（详见 %s）"
+              % (flags.get("错误", 0), flags.get("警告", 0), qa_path))
+
+    if args.tm_export and tm is not None:
+        n = tm.export_tsv(Path(args.tm_export))
+        print("已导出词典：%s（%d 条）" % (args.tm_export, n))
 
     print()
     print("=" * 62)
@@ -346,8 +401,66 @@ def run(argv: Optional[List[str]] = None) -> int:
     print("  别忘了安装中文字体 mod，否则会显示方块")
     print("  报告：%s" % report_path)
     print("=" * 62)
-    cache.close()
+    if cache is not None:
+        cache.close()
     return 0
+
+
+def _import_memory(tm, args, pack, config, out: Path) -> None:
+    """把各种现成资源预热进词典：TSV、现成汉化目录、英中插件对。"""
+    sources = []
+    if args.tm_import:
+        sources.extend(("file", p) for p in args.tm_import)
+    tm_from = args.tm_from or config.get("tm_from")
+    if tm_from:
+        sources.append(("dir", tm_from))
+    if args.tm_pair:
+        sources.extend(("pair", p) for p in args.tm_pair)
+
+    if not sources:
+        stats = tm.stats()
+        if stats.get("entries"):
+            print("词典：已有 %d 条（命中即免翻）" % stats["entries"])
+        return
+
+    for kind, value in sources:
+        try:
+            if kind == "file":
+                n = tm.import_file(Path(value))
+                print("词典导入 %s：%d 条" % (Path(value).name, n))
+            elif kind == "dir":
+                n = _import_from_dir(tm, Path(value), pack)
+                print("词典导入目录 %s：%d 条" % (value, n))
+            elif kind == "pair":
+                en, zh = Path(value[0]), Path(value[1])
+                n = tm.import_plugin_pair(en, zh)
+                print("词典导入插件对 %s + %s：%d 条" % (en.name, zh.name, n))
+        except Exception as exc:  # noqa: BLE001
+            print("词典导入失败（跳过）%s：%s" % (value, exc))
+    stats = tm.stats()
+    print("词典现有 %d 条" % stats.get("entries", 0))
+
+
+def _import_from_dir(tm, root: Path, pack) -> int:
+    """把现成汉化的 *_chinese.STRINGS 和包里的 *_english.STRINGS 按 ID 配对。"""
+    if root.is_file():
+        return tm.import_file(root)
+    total = 0
+    for path, base, kind in collect_chinese_tables(root):
+        refs = [r for r in pack.tables.get(base, []) if r.kind == kind]
+        if not refs:
+            refs = [r for r in pack.bsa_tables_for(base) if r.kind == kind]
+        if not refs:
+            continue
+        try:
+            en_table = refs[0].load()
+            zh_table = StringTable.load(path)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(en_table.entries) != len(zh_table.entries):
+            continue
+        total += tm.import_tables(en_table, zh_table, origin=path.name)
+    return total
 
 
 def glossary_digest(glossary: Optional[Glossary]) -> str:

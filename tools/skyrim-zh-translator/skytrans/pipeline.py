@@ -13,7 +13,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import esp
 from .cache import Cache
 from .fields import NEVER_TRANSLATE, translate_field
+from .bsa import Bsa, BsaError
 from .mcm import McmFile
+from .pex import PexFile
 from .providers import Provider, ProviderError
 from .scan import Pack, PluginInfo
 from .strings import StringTable
@@ -49,6 +51,8 @@ class Options:
     workers: int = 1
     fuzzy: float = 0.0
     meta_ini: bool = True
+    pex: bool = True
+    bsa_write: bool = False
 
 
 @dataclass
@@ -75,6 +79,7 @@ class Plan:
     tables: Dict[str, StringTable] = field(default_factory=dict)
     plugins: Dict[str, "esp.Plugin"] = field(default_factory=dict)
     mcm_files: List[McmFile] = field(default_factory=list)
+    pex_files: List["PexFile"] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     applied: List[Tuple[Unit, str, str]] = field(default_factory=list)
@@ -139,6 +144,7 @@ class Translator:
                 plan.warnings.append("跳过 %s：%s" % (plugin.name, exc))
 
         self._collect_mcm(plan)
+        self._collect_pex(plan)
 
         stats = plan.stats
         stats.setdefault("plugins", len(selected))
@@ -267,6 +273,61 @@ class Translator:
                         kind="mcm",
                     )
                 )
+
+    def _collect_pex(self, plan: Plan) -> None:
+        """收集 .pex 脚本里的界面字符串（松散脚本 + BSA 内脚本）。
+
+        只有当它看起来是「玩家能看到的话」时才进队列：脚本里绝大部分字符串是
+        函数名/属性名/状态名，翻译它们没有好处，还可能踩到 Papyrus 的大小写不敏感匹配。
+        """
+        if not self.options.pex:
+            return
+        files: List[PexFile] = []
+
+        for path in self.pack.scripts:
+            try:
+                files.append(PexFile(path=path))
+            except Exception as exc:  # noqa: BLE001
+                plan.warnings.append("脚本读取失败（已跳过）%s：%s" % (path.name, exc))
+
+        for archive, entries in self.pack.bsa_scripts().items():
+            try:
+                with Bsa(archive) as bsa:
+                    for entry in entries:
+                        try:
+                            files.append(
+                                PexFile(
+                                    data=bsa.read(entry),
+                                    archive=archive,
+                                    entry_path=entry.path,
+                                    label=entry.basename,
+                                )
+                            )
+                        except Exception:  # noqa: BLE001
+                            continue
+            except BsaError as exc:
+                plan.warnings.append("脚本归档读取失败（已跳过）%s：%s" % (archive.name, exc))
+
+        plan.pex_files = files
+        plan.stats["pex_files"] = len(files)
+        count = 0
+        for pex in files:
+            for item in pex.candidates:
+                text = item.text
+                if not self._unit_ok(text, plan):
+                    continue
+                plan.units.append(
+                    Unit(
+                        uid="pex|%s|%d" % (pex.origin, item.index),
+                        text=text,
+                        apply=lambda value, p=pex, i=item.index: p.set(i, value),
+                        source=pex.origin,
+                        kind="pex",
+                        edid=pex.label,
+                    )
+                )
+                count += 1
+        plan.stats["pex_units"] = count
 
     @staticmethod
     def _mcm_lang(filename: str) -> Optional[str]:
@@ -532,7 +593,7 @@ class Translator:
     def write(self, plan: Plan) -> Dict[str, int]:
         opts = self.options
         out = Path(opts.out)
-        written = {"plugins": 0, "tables": 0, "mcm": 0}
+        written = {"plugins": 0, "tables": 0, "mcm": 0, "pex": 0, "bsa": 0}
 
         plugin_by_base = {p.base: p for p in self.pack.plugins}
 
@@ -580,6 +641,42 @@ class Translator:
             written["mcm"] += 1
             self._log_write("MCM", target, written["mcm"])
 
+        # ---- 脚本（.pex）：默认输出松散文件，覆盖 BSA 内的同名脚本 ----
+        archive_patches: Dict[Path, Dict[str, bytes]] = {}
+        for pex in plan.pex_files:
+            if not pex.dirty:
+                continue
+            pex.verify()
+            if pex.archive is not None:
+                archive_patches.setdefault(Path(pex.archive), {})[pex.entry_path] = (
+                    pex.to_bytes()
+                )
+            if opts.in_place and pex.archive is None and pex.path is not None:
+                self._backup(pex.path)
+                pex.save(pex.path)
+                target = pex.path
+            else:
+                target = out / self._pex_target(pex)
+                pex.save(target)
+            written["pex"] += 1
+            self._log_write("脚本", target, written["pex"])
+
+        # ---- 可选：把改过的脚本重新打包回 BSA ----
+        if archive_patches and (opts.bsa_write or opts.in_place):
+            for archive, patches in archive_patches.items():
+                target = archive if opts.in_place else out / archive.name
+                if opts.in_place:
+                    self._backup(archive)
+                try:
+                    with Bsa(archive) as bsa:
+                        bsa.rewrite(target, patches, verify=True)
+                except BsaError as exc:
+                    plan.warnings.append("BSA 重打包失败（脚本仍以松散文件输出）%s：%s"
+                                         % (archive.name, exc))
+                    continue
+                written["bsa"] += 1
+                self._log_write("脚本归档", target, written["bsa"])
+
         if not opts.in_place:
             self._write_readme(out, written)
             if opts.meta_ini:
@@ -591,6 +688,24 @@ class Translator:
             self.log("  写出 %s: %s" % (kind, target))
         elif count == 7:
             self.log("  写出 %s: ……（完整列表见汉化报告）" % kind)
+
+    def _pex_target(self, pex: "PexFile") -> Path:
+        """把脚本放到输出目录里的正确位置（游戏只认 Data/Scripts 下）。"""
+        if pex.archive is not None:
+            parts = [p for p in pex.entry_path.split("\\") if p]
+            if parts and parts[0].lower() == "scripts":
+                parts = parts[1:]
+            return Path("Scripts").joinpath(*parts) if parts else Path("Scripts") / pex.label
+        if pex.path is not None:
+            try:
+                return pex.path.relative_to(self.pack.root)
+            except ValueError:
+                parts = list(pex.path.parts)
+                if "scripts" in [p.lower() for p in parts]:
+                    index = [p.lower() for p in parts].index("scripts")
+                    return Path(*parts[index:])
+                return Path("Scripts") / pex.path.name
+        return Path("Scripts") / pex.label
 
     def _renamed_table(self, name: str) -> str:
         suffix = Path(name).suffix
@@ -631,7 +746,11 @@ class Translator:
     def _write_readme(self, out: Path, written: Dict[str, int]) -> None:
         out.mkdir(parents=True, exist_ok=True)
         text = README_TEMPLATE.format(
-            plugins=written["plugins"], tables=written["tables"], mcm=written["mcm"]
+            plugins=written["plugins"],
+            tables=written["tables"],
+            mcm=written["mcm"],
+            pex=written.get("pex", 0),
+            bsa=written.get("bsa", 0),
         )
         (out / "安装说明.txt").write_text(text, encoding="utf-8")
 
@@ -643,6 +762,8 @@ README_TEMPLATE = """天际模组汉化包（由 skyrim-zh-translator 生成）
   插件（含中文内嵌字符串） : {plugins} 个
   字符串表 (.STRINGS 等)   : {tables} 个
   MCM 菜单翻译文件         : {mcm} 个
+  脚本 (.pex，界面文字)    : {pex} 个
+  重打包的 BSA             : {bsa} 个（0 表示只输出松散脚本）
 
 安装（MO2）：
   1. 把整个文件夹压缩成 zip，或用 MO2 的「从文件夹安装」指向本目录；
@@ -687,6 +808,8 @@ def write_report(
         "- 词典命中：%d 条；缓存命中：%d 条；实际调用接口：%d 条"
         % (s.get("tm_hits", 0), s.get("cache_hits", 0), s.get("api_items", 0)),
         "- 已写回：%d 条；保留原文：%d 条" % (s.get("applied", 0), s.get("unchanged", 0)),
+        "- 脚本（.pex）：%d 个文件，其中界面文字 %d 条"
+        % (s.get("pex_files", 0), s.get("pex_units", 0)),
         "- 判定已是中文而跳过：%d 条" % s.get("already_zh", 0),
         "- 判定非文本而跳过：%d 条" % s.get("not_text", 0),
         "",

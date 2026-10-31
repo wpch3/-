@@ -21,6 +21,23 @@ from skytrans.scan import scan_pack  # noqa: E402
 from skytrans.strings import StringTable  # noqa: E402
 from skytrans.textfilter import Protector, is_translatable, split_text  # noqa: E402
 
+try:  # 允许 `python -m unittest discover -s tests` 与包内两种跑法
+    from tests.test_bsa import build_bsa as _build_bsa
+    from tests.test_pex import build_pex as _build_pex
+except ImportError:  # pragma: no cover
+    from test_bsa import build_bsa as _build_bsa
+    from test_pex import build_pex as _build_pex
+
+PEX_SAMPLE = [
+    "Script",  # 0 对象名
+    "ObjectReference",  # 1 父类
+    "",  # 2 docstring
+    "",  # 3 auto 状态
+    "GetState",  # 4 函数名
+    "Hello traveler, welcome to Whiterun",  # 5 玩家可见
+    "Dialogue Menu",  # 6 玩家可见
+]
+
 
 # ----------------------------------------------------------------------
 # 构造合成插件
@@ -369,6 +386,78 @@ class PipelineTests(unittest.TestCase):
             translator2.translate(plan2)
             self.assertEqual(translator2.provider.calls, 0)
             self.assertGreater(calls, 0)
+
+    def test_pex_end_to_end(self):
+        """脚本里的界面文字被翻译，标识符与指令区原样保留。"""
+        from skytrans.pex import PexFile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "pack"
+            (root / "Scripts").mkdir(parents=True)
+            raw = _build_pex(PEX_SAMPLE)
+            (root / "Scripts" / "Foo.pex").write_bytes(raw)
+            (root / "ModA.esp").write_bytes(make_plugin())
+
+            pack = scan_pack(root, use_bsa=False, log=lambda *a: None)
+            self.assertEqual(len(pack.scripts), 1)
+            out = Path(tmp) / "out"
+            opts = Options(out=out, use_bsa=False)
+            cache = Cache(Path(tmp) / "cache.sqlite", "mock")
+            translator = Translator(
+                pack, opts, cache=cache, provider=MockProvider(), log=lambda *a: None
+            )
+            plan = translator.build_plan()
+            self.assertEqual(plan.stats.get("pex_units"), 2)
+            translator.translate(plan)
+            written = translator.write(plan)
+            self.assertEqual(written["pex"], 1)
+
+            target = out / "Scripts" / "Foo.pex"
+            self.assertTrue(target.exists())
+            before = PexFile(data=raw)
+            after = PexFile(path=target)
+            self.assertEqual(len(before.strings), len(after.strings))
+            self.assertEqual(before._tail, after._tail)
+            # 两条人话被翻，标识符一个没动
+            self.assertNotEqual(after.strings[5].raw, before.strings[5].raw)
+            self.assertNotEqual(after.strings[6].raw, before.strings[6].raw)
+            self.assertEqual(after.strings[4].raw, before.strings[4].raw)
+
+    def test_pex_bsa_write(self):
+        """--bsa-write：把脚本重打包回 BSA，读回来内容一致。"""
+        from skytrans.bsa import Bsa
+        from skytrans.pex import PexFile
+
+        raw_pex = _build_pex(PEX_SAMPLE)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "pack"
+            root.mkdir()
+            (root / "Mods.bsa").write_bytes(
+                _build_bsa({r"scripts\Foo.pex": raw_pex})
+            )
+            (root / "ModA.esp").write_bytes(make_plugin())
+
+            pack = scan_pack(root, use_bsa=True, log=lambda *a: None)
+            out = Path(tmp) / "out"
+            opts = Options(out=out, use_bsa=True, bsa_write=True)
+            cache = Cache(Path(tmp) / "cache.sqlite", "mock")
+            translator = Translator(
+                pack, opts, cache=cache, provider=MockProvider(), log=lambda *a: None
+            )
+            plan = translator.build_plan()
+            translator.translate(plan)
+            written = translator.write(plan)
+            self.assertEqual(written["bsa"], 1)
+
+            archive = out / "Mods.bsa"
+            self.assertTrue(archive.exists())
+            with Bsa(archive) as bsa:
+                entry = bsa.find([".pex"])[0]
+                data = bsa.read(entry)
+            inside = PexFile(data=data)
+            self.assertNotEqual(inside.strings[5].raw, PexFile(data=raw_pex).strings[5].raw)
+            # 松散文件也同时输出，保证不依赖重打包也能生效（BSA 内路径为小写）
+            self.assertTrue((out / "Scripts" / "foo.pex").exists())
 
     def test_already_chinese_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:

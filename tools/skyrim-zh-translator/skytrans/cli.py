@@ -74,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-lang", default="english", help="输出哪种语言的字符串表后缀")
     p.add_argument("--in-place", action="store_true", help="直接改原文件（自动备份 .orig）")
     p.add_argument("--no-bsa", action="store_true", help="不解析 BSA")
+    p.add_argument("--no-pex", action="store_true", help="不翻译 .pex 脚本里的界面文字")
+    p.add_argument("--bsa-write", action="store_true",
+                   help="把改过的脚本重新打包成 BSA（默认只输出松散文件，更安全）")
     p.add_argument("--batch-chars", type=int, default=2400, help="单次请求字符上限")
     p.add_argument("--batch-items", type=int, default=30, help="单次请求条数上限")
     p.add_argument("--piece-chars", type=int, default=1500, help="长文本切分长度")
@@ -96,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--import-review", default=None, help="导入校对后的 CSV")
     p.add_argument("--wizard", action="store_true", help="强制进入交互向导")
     p.add_argument("-y", "--yes", action="store_true", help="不询问，直接开始")
-    p.add_argument("--version", action="version", version="skytrans 1.1")
+    p.add_argument("--version", action="version", version="skytrans 1.2")
     return p
 
 
@@ -294,7 +297,12 @@ def run(argv: Optional[List[str]] = None) -> int:
         else bool(config.get("export_review", True)),
         workers=int(args.workers if args.workers is not None else config.get("workers", 1)),
         fuzzy=float(args.fuzzy if args.fuzzy is not None else config.get("fuzzy", 0.0)),
+        pex=not args.no_pex and not bool(config.get("no_pex", False)),
+        bsa_write=bool(args.bsa_write or config.get("bsa_write", False)),
     )
+    if opts.bsa_write and not opts.use_bsa:
+        print("提示：--bsa-write 需要解析 BSA，已自动关闭 --no-bsa")
+        opts.use_bsa = True
 
     glossary = None
     glossary_path = Path(args.glossary)
@@ -395,8 +403,10 @@ def run(argv: Optional[List[str]] = None) -> int:
     print()
     print("=" * 62)
     print("完成！输出目录：%s" % out.resolve())
-    print("  插件 %d 个 / 字符串表 %d 个 / MCM %d 个" %
-          (written["plugins"], written["tables"], written["mcm"]))
+    print("  插件 %d 个 / 字符串表 %d 个 / MCM %d 个 / 脚本 %d 个"
+          % (written["plugins"], written["tables"], written["mcm"], written["pex"]))
+    if written.get("bsa"):
+        print("  重打包 BSA %d 个（已通过读回校验）" % written["bsa"])
     print("  安装：把该目录作为一个 mod 添加进 MO2（放在被汉化 mod 下方）")
     print("  别忘了安装中文字体 mod，否则会显示方块")
     print("  报告：%s" % report_path)
@@ -484,6 +494,9 @@ def _summary(plan, out: Path) -> None:
     print("  可翻译文本      : %d 条" % len(plan.units))
     print("  已是中文（跳过）: %d 条" % s.get("already_zh", 0))
     print("  非文本（跳过）  : %d 条" % s.get("not_text", 0))
+    if s.get("pex_files"):
+        print("  脚本 .pex       : %d 个文件 / %d 条界面文字"
+              % (s.get("pex_files", 0), s.get("pex_units", 0)))
     chars = sum(len(u.text) for u in plan.units)
     print("  总字符数        : %d（约 %.0f 万）" % (chars, chars / 10000))
     print("  预估输入 token  : %d" % int(chars / 3.2))

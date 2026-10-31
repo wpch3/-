@@ -46,6 +46,9 @@ PRUNE_DIRS = {
     "node_modules",
 }
 
+# 找脚本时也要进 Scripts 目录（其它重资源目录照旧跳过）
+SCRIPT_PRUNE_DIRS = PRUNE_DIRS - {"scripts", "source", "docs"}
+
 TABLE_RE = re.compile(
     r"^(?P<base>.+)_(?P<lang>[A-Za-z]{2,20})\.(?P<kind>strings|dlstrings|ilstrings)$",
     re.IGNORECASE,
@@ -114,8 +117,10 @@ class Pack:
     tables: Dict[str, List[TableRef]] = field(default_factory=dict)
     mcm: List[Path] = field(default_factory=list)
     archives: List[Path] = field(default_factory=list)
+    scripts: List[Path] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     _bsa_index: Optional[Dict[str, TableRef]] = None
+    _bsa_scripts: Optional[Dict[Path, List[BsaEntry]]] = None
 
     # ---------- 查询 ----------
     def tables_for(self, plugin: PluginInfo, prefer_lang: str = "english") -> List[TableRef]:
@@ -130,10 +135,16 @@ class Pack:
         index = self._get_bsa_index()
         return _pick_language([t for t in index.get(base, [])], prefer_lang)
 
+    def bsa_scripts(self) -> Dict[Path, List[BsaEntry]]:
+        """BSA 里的 .pex：{归档路径: [条目]}"""
+        self._get_bsa_index()
+        return self._bsa_scripts or {}
+
     def _get_bsa_index(self) -> Dict[str, List[TableRef]]:
         if self._bsa_index is not None:
             return self._bsa_index
         index: Dict[str, List[TableRef]] = {}
+        scripts: Dict[Path, List[BsaEntry]] = {}
         for archive in self.archives:
             try:
                 bsa = Bsa(archive)
@@ -141,6 +152,9 @@ class Pack:
                 self.warnings.append("BSA 解析失败（已跳过）: %s (%s)" % (archive.name, exc))
                 continue
             for entry in bsa.entries:
+                if entry.path.endswith(".pex"):
+                    scripts.setdefault(archive, []).append(entry)
+                    continue
                 match = TABLE_RE.match(entry.basename)
                 if not match:
                     continue
@@ -155,6 +169,7 @@ class Pack:
                 index.setdefault(ref.base, []).append(ref)
             bsa.close()
         self._bsa_index = index
+        self._bsa_scripts = scripts
         return index
 
 
@@ -230,8 +245,17 @@ def scan_pack(root: Path, use_bsa: bool = True, log=print) -> Pack:
                 if "interface" in {p.lower() for p in here.parts}:
                     pack.mcm.append(full)
 
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames if d.lower() not in SCRIPT_PRUNE_DIRS and not d.startswith(".")
+        )
+        here = Path(dirpath)
+        for filename in filenames:
+            if filename.lower().endswith(".pex"):
+                pack.scripts.append(here / filename)
+
     log(
-        "扫描完成：%d 个插件（本地化 %d / 内嵌 %d），%d 个字符串表，%d 个 MCM 文件，%d 个 BSA"
+        "扫描完成：%d 个插件（本地化 %d / 内嵌 %d），%d 个字符串表，%d 个 MCM 文件，%d 个 BSA，%d 个脚本"
         % (
             len(pack.plugins),
             sum(1 for p in pack.plugins if p.localized),
@@ -239,6 +263,7 @@ def scan_pack(root: Path, use_bsa: bool = True, log=print) -> Pack:
             sum(len(v) for v in pack.tables.values()),
             len(pack.mcm),
             len(pack.archives),
+            len(pack.scripts),
         )
     )
     return pack

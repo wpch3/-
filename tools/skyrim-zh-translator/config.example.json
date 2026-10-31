@@ -12,5 +12,7 @@
   "fuzzy": 0.0,
   "output_lang": "english",
   "export_review": true,
-  "tm_from": ""
+  "tm_from": "",
+  "no_pex": false,
+  "bsa_write": false
 }

@@ -1,16 +1,21 @@
-"""BSA 归档只读支持（v103 Oblivion / v104 Skyrim LE / v105 Skyrim SE）。
+"""BSA 归档读写（v103 Oblivion / v104 Skyrim LE / v105 Skyrim SE）。
 
-只读取、不写回：汉化结果一律以「松散文件」输出，松散文件会覆盖 BSA 内的同名文件。
-
-很多模组把 `_english.strings` 打进 BSA，必须先取出来才能翻译。
-LZ4 解压为纯 Python 实现（SE 用的 LZ4 frame + 部分工具用的 block），无需第三方库。
-
+读取：很多模组把 `_english.strings`、`.pex` 打进 BSA，必须先取出来才能翻译。
 内存友好：只读取文件名表，文件内容按需 seek 读取。
+
+回写（v1.2）：`Bsa.rewrite()` 把归档重打包到**新文件**（绝不原地覆盖，除非调用方显式要求），
+未替换的条目按原字节搬运、替换的条目按归档原本的压缩方式重新压缩，布局沿用原档
+（目录顺序、文件名顺序、hash 全部不变），最后默认重新打开新档逐条比对内容。
+
+LZ4（frame + block）的解压与压缩都是纯 Python 实现，无需第三方库；
+`lz4_frame_compress` 的输出已用官方 lz4 库交叉校验（字节流可被 `lz4.frame.decompress` 解开）。
 """
 
 from __future__ import annotations
 
+import os
 import struct
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,6 +155,9 @@ class BsaEntry:
     size: int
     offset: int
     compressed: bool
+    hash: int = 0
+    folder: str = ""
+    toggle: bool = False  # 记录里的 0x40000000 位（仅在压缩存档里表示「本文件未压缩」）
 
     @property
     def basename(self) -> str:
@@ -163,6 +171,10 @@ class Bsa:
         self.flags = 0
         self.entries: List[BsaEntry] = []
         self._embedded_names = False
+        self._folder_records: List[dict] = []
+        self._names_blob = b""
+        self._stride = 16
+        self._file_flags = 0
         self._fh = None
         try:
             self._open()
@@ -201,18 +213,28 @@ class Bsa:
         has_names = bool(flags & 0x2)
 
         pos = 0
-        counts = []
-        for _ in range(dir_count):
-            counts.append(struct.unpack_from("<I", table, pos + 8)[0])
-            pos += stride
+        folders: List[dict] = []
+        for i in range(dir_count):
+            rec = table[i * stride : (i + 1) * stride]
+            count = struct.unpack_from("<I", rec, 8)[0]
+            if stride == 24:
+                stored = struct.unpack_from("<Q", rec, 16)[0]
+            else:
+                stored = struct.unpack_from("<I", rec, 12)[0]
+            folders.append({"raw": rec, "count": count, "stored": stored})
 
         entries: List[BsaEntry] = []
+        pos = dir_count * stride
         try:
-            for count in counts:
+            for index, folder_rec in enumerate(folders):
+                folder_rec["start"] = dir_offset + pos
                 name_len = table[pos]
-                folder = table[pos + 1 : pos + name_len].decode("latin-1").rstrip("\x00")
+                name_bytes = table[pos + 1 : pos + name_len]
+                folder = name_bytes.decode("latin-1")
+                folder_rec["name"] = name_bytes
                 pos += name_len + 1
-                for _ in range(count):
+                for _ in range(folder_rec["count"]):
+                    file_hash = struct.unpack_from("<Q", table, pos)[0]
                     raw_size = struct.unpack_from("<I", table, pos + 8)[0]
                     offset = struct.unpack_from("<I", table, pos + 12)[0]
                     toggle = bool(raw_size & 0x40000000)
@@ -221,10 +243,14 @@ class Bsa:
                             path=folder.lower() + "\\",
                             size=raw_size & 0x3FFFFFFF,
                             offset=offset,
-                            compressed=archive_compressed != toggle,
+                            compressed=bool(archive_compressed and not toggle),
+                            hash=file_hash,
+                            toggle=toggle,
+                            folder=folder,
                         )
                     )
                     pos += 16
+            names_start = dir_offset + pos
             if has_names:
                 for entry in entries:
                     end = table.index(b"\x00", pos)
@@ -234,6 +260,15 @@ class Bsa:
             raise BsaError("记录表损坏: %s" % exc) from exc
 
         self.entries = entries
+        self._folder_records = folders
+        self._stride = stride
+        rel_names = names_start - dir_offset
+        self._names_blob = table[rel_names:rel_names + file_name_len]
+        self._data_start = names_start + file_name_len
+        self._dir_offset = dir_offset
+        self._header = header
+        self._archive_compressed = archive_compressed
+        self._file_flags = struct.unpack_from("<I", header, 32)[0]
 
     # -- 读取 --
     def read(self, entry: BsaEntry) -> bytes:
@@ -256,6 +291,165 @@ class Bsa:
             return _decompress_lz4(payload, original_size)
         return _decompress_legacy(payload)
 
+    # ------------------------------------------------------------------
+    # 回写：重打包
+    # ------------------------------------------------------------------
+    def rewrite(
+        self,
+        dst: Path,
+        replacements: Optional[dict] = None,
+        verify: bool = True,
+    ) -> dict:
+        """把归档重写到 dst（不原地覆盖）。
+
+        replacements: {归档内路径: 新的未压缩内容}，路径大小写/斜杠不敏感。
+        未替换的条目按原字节搬运；替换的条目按归档原本的压缩方式重新压缩。
+        完成后默认重开 dst 校验每个条目内容，失败抛 BsaError。
+        """
+        if self._fh is None:
+            raise BsaError("归档已关闭")
+        dst = Path(dst)
+        norm = {}
+        for key, value in (replacements or {}).items():
+            norm[key.lower().replace("/", "\\")] = value
+        known = {e.path for e in self.entries}
+        missing = sorted(set(norm) - known)
+        if missing:
+            raise BsaError("归档内不存在这些文件: %s" % ", ".join(missing[:5]))
+
+        total = sum(f["count"] for f in self._folder_records)
+        if total != len(self.entries):
+            raise BsaError(
+                "目录记录与条目数不一致（%d vs %d），拒绝写回" % (total, len(self.entries))
+            )
+        archive_compressed = self._archive_compressed
+        # 1) 目录块 / 名称块 / 数据区的位置（布局与原档一致）
+        cursor = self._dir_offset + len(self._folder_records) * self._stride
+        block_starts = []
+        for folder in self._folder_records:
+            block_starts.append(cursor)
+            cursor += 1 + len(folder["name"]) + 1 + 16 * folder["count"]
+        names_start = cursor
+        data_start = names_start + len(self._names_blob)
+
+        # 2) 计算每个条目的数据块
+        index = 0
+        layout = []  # 每个条目: dict(size_field, offset, payload)
+        offset = data_start
+        for folder in self._folder_records:
+            rows = []
+            for _ in range(folder["count"]):
+                entry = self.entries[index]
+                index += 1
+                if entry.path in norm:
+                    content = norm[entry.path]
+                    body = content
+                    if self._embedded_names:
+                        name = entry.path.encode("latin-1", "replace")
+                        body = bytes([len(name) + 1]) + name + b"\x00" + content
+                    if archive_compressed:
+                        packed = (
+                            lz4_frame_compress(body)
+                            if self.version >= 105
+                            else zlib.compress(body, 9)
+                        )
+                        block = struct.pack("<I", len(body)) + packed
+                    else:
+                        block = body
+                    # 未压缩存档的 size 位必须为 0（第三方工具按此判断），
+                    # 只有在压缩存档里「本文件不压缩」时才置位。
+                    size_field = len(block)
+                    payload = block
+                else:
+                    size_field = entry.size | (0x40000000 if entry.toggle else 0)
+                    payload = None  # 原样拷贝
+                rows.append(
+                    {
+                        "entry": entry,
+                        "size_field": size_field,
+                        "offset": offset,
+                        "payload": payload,
+                    }
+                )
+                offset += len(payload) if payload is not None else entry.size
+            layout.append(rows)
+
+        # 3) 写临时文件，成功后再替换目标，避免写坏原档
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=".bsa-tmp-", dir=str(dst.parent))
+        replaced = 0
+        try:
+            with os.fdopen(tmp_fd, "wb") as out:
+                out.write(self._header)
+                for folder, rows, start in zip(self._folder_records, layout, block_starts):
+                    rec = bytearray(folder["raw"])
+                    stored = start + len(self._names_blob)
+                    if self._stride == 24:
+                        struct.pack_into("<Q", rec, 16, stored)
+                    else:
+                        struct.pack_into("<I", rec, 12, stored)
+                    out.write(rec)
+                for folder, rows in zip(self._folder_records, layout):
+                    out.write(bytes([len(folder["name"]) + 1]))
+                    out.write(folder["name"])
+                    out.write(b"\x00")
+                    for row in rows:
+                        entry = row["entry"]
+                        out.write(
+                            struct.pack(
+                                "<QII", entry.hash, row["size_field"], row["offset"]
+                            )
+                        )
+                out.write(self._names_blob)
+                for rows in layout:
+                    for row in rows:
+                        if row["payload"] is not None:
+                            out.write(row["payload"])
+                            replaced += 1
+                        else:
+                            self._fh.seek(row["entry"].offset)
+                            left = row["entry"].size
+                            while left:
+                                chunk = self._fh.read(min(left, 1 << 20))
+                                if not chunk:
+                                    raise BsaError("源数据截断: %s" % row["entry"].path)
+                                out.write(chunk)
+                                left -= len(chunk)
+            try:
+                # 保持与原档一致的权限（Windows 上无效但不报错）
+                mode = self.path.stat().st_mode & 0o777 if self.path.exists() else 0o644
+                os.chmod(tmp_name, mode)
+            except OSError:
+                pass
+            os.replace(tmp_name, str(dst))
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+        # 4) 自检：重新打开新档，逐个比对内容
+        if verify:
+            with Bsa(dst) as check:
+                fresh = {e.path: e for e in check.entries}
+                if len(fresh) != len(self.entries):
+                    raise BsaError("回写后条目数不一致")
+                for row in (r for rows in layout for r in rows):
+                    entry = row["entry"]
+                    target = fresh.get(entry.path)
+                    if target is None:
+                        raise BsaError("回写后丢失条目: %s" % entry.path)
+                    want = norm[entry.path] if entry.path in norm else self.read(entry)
+                    if check.read(target) != want:
+                        raise BsaError("回写校验失败: %s" % entry.path)
+        return {
+            "entries": len(self.entries),
+            "replaced": replaced,
+            "compressed": archive_compressed,
+            "size": dst.stat().st_size,
+        }
+
     def find(self, suffixes: Iterable[str]) -> List[BsaEntry]:
         wanted = tuple(s.lower() for s in suffixes)
         return [e for e in self.entries if e.path.endswith(wanted)]
@@ -276,3 +470,126 @@ def iter_archives(root: Path) -> Iterator[Path]:
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() == ".bsa":
             yield path
+
+
+# --------------------------------------------------------------------------
+# LZ4 frame 压缩（纯 Python，仅供 BSA 回写使用）
+# --------------------------------------------------------------------------
+def _rotl32(x: int, r: int) -> int:
+    return ((x << r) | (x >> (32 - r))) & 0xFFFFFFFF
+
+
+def xxh32(data: bytes, seed: int = 0) -> int:
+    P1, P2, P3, P4, P5 = 2654435761, 2246822519, 3266489917, 668265263, 374761393
+    M = 0xFFFFFFFF
+    n = len(data)
+    pos = 0
+    if n >= 16:
+        v1 = (seed + P1 + P2) & M
+        v2 = (seed + P2) & M
+        v3 = seed & M
+        v4 = (seed - P1) & M
+
+        def rnd(acc: int, lane: int) -> int:
+            acc = (acc + lane * P2) & M
+            acc = _rotl32(acc, 13)
+            return (acc * P1) & M
+
+        while pos + 16 <= n:
+            v1 = rnd(v1, struct.unpack_from("<I", data, pos)[0])
+            v2 = rnd(v2, struct.unpack_from("<I", data, pos + 4)[0])
+            v3 = rnd(v3, struct.unpack_from("<I", data, pos + 8)[0])
+            v4 = rnd(v4, struct.unpack_from("<I", data, pos + 12)[0])
+            pos += 16
+        h = (_rotl32(v1, 1) + _rotl32(v2, 7) + _rotl32(v3, 12) + _rotl32(v4, 18)) & M
+    else:
+        h = (seed + P5) & M
+    h = (h + n) & M
+    while pos + 4 <= n:
+        h = (h + struct.unpack_from("<I", data, pos)[0] * P3) & M
+        h = (_rotl32(h, 17) * P4) & M
+        pos += 4
+    while pos < n:
+        h = (h + data[pos] * P5) & M
+        h = (_rotl32(h, 11) * P1) & M
+        pos += 1
+    h ^= h >> 15
+    h = (h * P2) & M
+    h ^= h >> 13
+    h = (h * P3) & M
+    h ^= h >> 16
+    return h & M
+
+
+def lz4_block_compress(src: bytes, min_match: int = 4) -> bytes:
+    """贪心哈希表压缩，产出标准 LZ4 block（末 5 字节必为字面量，可被 lz4.block 解开）。"""
+    n = len(src)
+    out = bytearray()
+    table = {}
+    anchor = 0
+    i = 0
+    match_limit = n - 12  # 标准要求最后一个匹配至少在块末 12 字节前开始
+
+    def emit_length(extra: int) -> None:
+        while extra >= 255:
+            out.append(255)
+            extra -= 255
+        out.append(extra)
+
+    def emit_sequence(lit_start: int, lit_end: int, offset: int, match_len: int) -> None:
+        lit_len = lit_end - lit_start
+        ml = match_len - min_match
+        out.append(((lit_len if lit_len < 15 else 15) << 4) | (ml if ml < 15 else 15))
+        if lit_len >= 15:
+            emit_length(lit_len - 15)
+        out.extend(src[lit_start:lit_end])
+        out.extend(struct.pack("<H", offset))
+        if ml >= 15:
+            emit_length(ml - 15)
+
+    while i < match_limit:
+        key = src[i : i + 4]
+        cand = table.get(key)
+        table[key] = i
+        if cand is None or i - cand > 65535:
+            i += 1
+            continue
+        max_len = n - 5 - i
+        length = min_match
+        while length < max_len and src[cand + length] == src[i + length]:
+            length += 1
+        if length < min_match or length > max_len:
+            i += 1
+            continue
+        emit_sequence(anchor, i, i - cand, length)
+        i += length
+        anchor = i
+
+    # 收尾：剩下的全部作为字面量
+    lit_len = n - anchor
+    out.append((lit_len if lit_len < 15 else 15) << 4)
+    if lit_len >= 15:
+        emit_length(lit_len - 15)
+    out.extend(src[anchor:])
+    return bytes(out)
+
+
+def lz4_frame_compress(data: bytes, block_size: int = 1 << 16) -> bytes:
+    """产出标准 LZ4 frame（独立块、无校验），与 Skyrim SE 的 BSA 兼容。"""
+    code = {1 << 16: 4, 1 << 18: 5, 1 << 20: 6, 1 << 22: 7}[block_size]
+    flg = 0x60  # version=01, block independence=1
+    bd = code << 4
+    header = struct.pack("<I", LZ4_MAGIC) + bytes([flg, bd])
+    header += bytes([(xxh32(bytes([flg, bd])) >> 8) & 0xFF])
+    out = bytearray(header)
+    for pos in range(0, len(data), block_size):
+        chunk = data[pos : pos + block_size]
+        packed = lz4_block_compress(chunk)
+        if len(packed) >= len(chunk):
+            out += struct.pack("<I", len(chunk) | 0x80000000)
+            out += chunk
+        else:
+            out += struct.pack("<I", len(packed))
+            out += packed
+    out += struct.pack("<I", 0)
+    return bytes(out)

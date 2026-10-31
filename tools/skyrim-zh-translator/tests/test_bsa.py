@@ -11,7 +11,15 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from skytrans.bsa import Bsa, lz4_frame_decompress  # noqa: E402
+from skytrans.bsa import (  # noqa: E402
+    Bsa,
+    BsaError,
+    lz4_block_compress,
+    lz4_block_decompress,
+    lz4_frame_compress,
+    lz4_frame_decompress,
+    xxh32,
+)
 from skytrans.strings import StringTable  # noqa: E402
 
 # 由 lz4 官方实现生成的 frame，内容为 132 字节的 MCM 文本（3 次重复）
@@ -24,12 +32,13 @@ FRAME_TEXT = b"$ModName\tMy Test Mod\n$Toggle\tEnable feature\n" * 3
 
 
 def _payload(data: bytes, compress: bool) -> bytes:
-    """返回 (payload, 状态位)。"""
-    if compress:
-        import lz4.frame
+    """返回 (payload, 是否置 0x40000000 位)。
 
-        frame = lz4.frame.compress(data)
-        return struct.pack("<I", len(data)) + frame, True
+    真实约定：该位只在「压缩存档里本文件不压缩」时才置位；压缩存档里被压缩的
+    文件该位必须为 0，未压缩存档里所有文件也都为 0。
+    """
+    if compress:
+        return struct.pack("<I", len(data)) + lz4_frame_compress(data), False
     return data, False
 
 
@@ -46,6 +55,8 @@ def build_bsa(files, compress=False, embedded=False) -> bytes:
     file_name_len = sum(len(n) + 1 for v in folders.values() for n, _ in v)
 
     flags = 0x3
+    if compress:
+        flags |= 0x4  # 压缩存档
     if embedded:
         flags |= 0x100
 
@@ -74,14 +85,22 @@ def build_bsa(files, compress=False, embedded=False) -> bytes:
             payloads.append((payload, is_compressed))
             offsets.append(None)
 
-    folder_records = b""
+    # 目录块起点（紧跟在目录记录之后），用于填真实的 name_offset
+    header_len = 36
+    record_len = dir_count * 24
+    block_starts = []
+    cursor = header_len + record_len
     for folder, items in folders.items():
+        block_starts.append(cursor)
+        cursor += 1 + len(folder) + 1 + 16 * len(items)
+
+    folder_records = b""
+    for folder, items, start in zip(folders, folders.values(), block_starts):
         folder_records += (
             struct.pack("<Q", 0)
             + struct.pack("<I", len(items))
             + struct.pack("<I", 0)
-            + struct.pack("<I", 0)
-            + struct.pack("<I", 0)
+            + struct.pack("<Q", start + file_name_len)
         )
 
     blocks = bytearray()
@@ -114,6 +133,32 @@ def build_bsa(files, compress=False, embedded=False) -> bytes:
             index += 1
 
     return header + folder_records + bytes(out) + names + b"".join(p for p, _ in payloads)
+
+
+class Lz4Tests(unittest.TestCase):
+    def test_xxh32_vector(self):
+        self.assertEqual(xxh32(b""), 0x02CC5D05)
+
+    def test_frame_roundtrip(self):
+        payload = (
+            b"$ModName\tMy Test Mod\n$Toggle\tEnable feature\n" * 40
+            + bytes(range(256)) * 8
+        )
+        for size in (0, 1, 17, 65535, 65536, 200000):
+            data = payload[:size]
+            self.assertEqual(lz4_frame_decompress(lz4_frame_compress(data)), data)
+
+    def test_frame_starts_with_standard_header(self):
+        frame = lz4_frame_compress(b"hello world" * 100)
+        self.assertEqual(frame[:4], b"\x04\x22\x4d\x18")
+        self.assertEqual(frame[4], 0x60)  # 版本 01 + 独立块
+        self.assertEqual(frame[-4:], b"\x00\x00\x00\x00")
+
+    def test_block_roundtrip(self):
+        data = (b"papyrus" * 500) + os.urandom(2000)
+        packed = lz4_block_compress(data)
+        self.assertLess(len(packed), len(data))
+        self.assertEqual(lz4_block_decompress(packed, len(data)), data)
 
 
 class BsaTests(unittest.TestCase):
@@ -150,10 +195,6 @@ class BsaTests(unittest.TestCase):
             bsa.close()
 
     def test_read_lz4_compressed(self):
-        try:
-            import lz4.frame  # noqa: F401
-        except ImportError:
-            self.skipTest("需要 lz4 生成测试数据")
         table = StringTable(
             path=Path("x"),
             kind="dlstrings",
@@ -167,6 +208,100 @@ class BsaTests(unittest.TestCase):
             entry = bsa.find([".dlstrings"])[0]
             self.assertEqual(bsa.read(entry), table)
             bsa.close()
+
+    def test_rewrite_identity(self):
+        """不替换任何文件时，重打包结果应与原档逐字节相同。"""
+        raw = build_bsa({r"strings\\SkyUI_english.STRINGS": b"$a\tHello\n" * 10})
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            with Bsa(src) as bsa:
+                stats = bsa.rewrite(dst)
+            self.assertEqual(stats["entries"], 1)
+            self.assertEqual(stats["replaced"], 0)
+            self.assertEqual(dst.read_bytes(), raw)
+
+    def test_rewrite_replaces_content(self):
+        files = {
+            r"strings\\SkyUI_english.STRINGS": b"$a\tHello\n",
+            r"scripts\\Foo.pex": b"\xde\xc0\x57\xfa" + b"\x00" * 20,
+        }
+        raw = build_bsa(files)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            new_pex = b"\xde\xc0\x57\xfa" + b"\x11" * 40
+            with Bsa(src) as bsa:
+                stats = bsa.rewrite(dst, {r"scripts\\foo.pex": new_pex})
+            self.assertEqual(stats["replaced"], 1)
+            with Bsa(dst) as check:
+                found = {e.path: check.read(e) for e in check.entries}
+            self.assertEqual(found[r"scripts\\foo.pex"], new_pex)
+            self.assertEqual(
+                found[r"strings\\skyui_english.strings"], files[r"strings\\SkyUI_english.STRINGS"]
+            )
+
+    def test_rewrite_compressed_archive(self):
+        files = {r"scripts\\Bar.pex": b"payload-" * 200}
+        raw = build_bsa(files, compress=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            with Bsa(src) as bsa:
+                self.assertTrue(bsa.entries[0].compressed)
+                new_data = b"translated-" * 120
+                bsa.rewrite(dst, {r"scripts\\bar.pex": new_data})
+            with Bsa(dst) as check:
+                entry = check.entries[0]
+                self.assertTrue(entry.compressed)
+                self.assertEqual(check.read(entry), new_data)
+
+    def test_rewrite_embedded_names(self):
+        raw = build_bsa({r"scripts\Foo.pex": b"AAAA" * 10}, embedded=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            with Bsa(src) as bsa:
+                self.assertTrue(bsa._embedded_names)
+                bsa.rewrite(dst, {r"scripts\foo.pex": b"BBBB" * 5})
+            with Bsa(dst) as check:
+                self.assertTrue(check._embedded_names)
+                self.assertEqual(check.read(check.entries[0]), b"BBBB" * 5)
+
+    def test_rewrite_unknown_entry_rejected(self):
+        raw = build_bsa({r"scripts\\Foo.pex": b"x"})
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            with Bsa(src) as bsa:
+                with self.assertRaises(BsaError):
+                    bsa.rewrite(dst, {r"scripts\\Missing.pex": b"y"})
+
+    def test_rewrite_keeps_other_entries(self):
+        files = {
+            r"scripts\\A.pex": b"a" * 100,
+            r"scripts\\B.pex": b"b" * 50,
+            r"meshes\\x.nif": b"\x00" * 200,
+        }
+        raw = build_bsa(files)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "In.bsa"
+            dst = Path(tmp) / "Out.bsa"
+            src.write_bytes(raw)
+            with Bsa(src) as bsa:
+                before = {e.path: bsa.read(e) for e in bsa.entries}
+                bsa.rewrite(dst, {r"scripts\\a.pex": b"z" * 10})
+            with Bsa(dst) as check:
+                after = {e.path: check.read(e) for e in check.entries}
+            self.assertEqual(before.keys(), after.keys())
+            self.assertEqual(after[r"scripts\\a.pex"], b"z" * 10)
+            for key in (r"scripts\\b.pex", r"meshes\\x.nif"):
+                self.assertEqual(after[key], before[key])
 
     def test_non_bsa_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

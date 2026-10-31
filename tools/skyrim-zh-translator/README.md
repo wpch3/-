@@ -5,9 +5,10 @@
 
 纯 Python 标准库实现，**不需要 pip 安装任何东西**（Python 3.9+）。
 
-> v1.1 起加入了从 xTranslator / ESP-ESM Translator 学来的**词典（翻译记忆）**、
-> **字段长度质检**、**并发请求**，以及按 xTranslator 记录定义重建的**字段白名单**。
-> 详见第 4、6、15 节。
+> v1.1 加入了从 xTranslator / ESP-ESM Translator 学来的**词典（翻译记忆）**、
+> **字段长度质检**、**并发请求**，以及按 xTranslator 记录定义重建的**字段白名单**；
+> v1.2 补上了对标 ESP-ESM Translator 的两块硬骨头：**`.pex` 脚本字符串翻译**与
+> **BSA 回写重打包**（默认仍输出松散文件，不碰原档）。详见第 4、6、7、15 节。
 
 ---
 
@@ -19,7 +20,8 @@
 | `.STRINGS / .DLSTRINGS / .ILSTRINGS`（本地化插件） | 同上，但文本单独存在字符串表里 | ✅ 输出同名 `_english` 覆盖 |
 | **打包在 BSA 里的**字符串表 | 很多 mod 把 strings 塞进 BSA | ✅ 自动解包读取（纯 Python LZ4） |
 | MCM 菜单文本 `Interface/Translations/*_english.txt` | 模组配置菜单里的每一行文字 | ✅ 输出同名覆盖 |
-| Papyrus 脚本里写死的字符串（`.pex`） | 作者直接把英文写进脚本 | ❌ 只能等作者改脚本 |
+| Papyrus 脚本里写死的字符串（`.pex`） | 作者把英文直接写进脚本（消息框、通知、SkyUI 选项标题） | ✅ 改字符串表，指令与结构一个字节不动 |
+| **打包在 BSA 里的**脚本 | 绝大多数 mod 把 `.pex` 塞进 BSA | ✅ 自动解出→翻译→默认输出松散脚本覆盖；可选重打包 |
 | 语音、贴图、字体 | — | ❌ 与文本无关 |
 
 ---
@@ -158,6 +160,22 @@ python3 run.py "D:\MO2\mods" --workers 8 --batch-chars 3000
 
 ---
 
+### 脚本（`.pex`）为什么不会把 mod 改坏
+
+`.pex` 是编译后的字节码，随便改长度就会崩。我们的做法是：
+
+1. 按 Papyrus 3.1/3.2 规范把文件拆开：头部 → 字符串表 → 调试信息 → 对象/属性/函数 → 指令；
+2. **只替换字符串表里已有条目的内容**，条数、顺序、索引全不变；
+3. 指令字节、对象大小字段、调试信息**原样搬运**（它们只引用索引，不引用绝对偏移，所以不需要重算）；
+4. 通过结构遍历，把「被当作名称/文档引用」的索引挑出来（对象名、父类名、属性名、docstring、auto 状态、调试信息函数名），这些一律不碰；
+5. 剩下的条目再过一遍「像不像人话」：Papyrus 标识符不能含空格，所以「含空格或句末标点」就挡掉了绝大多数标识符，再排除路径、扩展名、`$` 键、`_root.Xxx.` 这类点分名字；
+6. 写完后**重新解析一遍**，校验条数、索引、表后的全部字节与原文一致，不一致就报错不写。
+
+BSA 重打包同理：默认**不碰原档**，只把改过的脚本以松散文件输出（松散文件天然覆盖 BSA 内同名文件）；
+加 `--bsa-write` 才会额外复制一份归档并重新打包，且重打包后会自动读回逐条比对内容。
+
+---
+
 ## 8. 输出目录里有什么
 
 ```
@@ -168,6 +186,10 @@ python3 run.py "D:\MO2\mods" --workers 8 --batch-chars 3000
 │  └─ ModB_english.STRINGS    ← 本地化插件的字符串表（同名覆盖原文件）
 ├─ Interface/Translations/
 │  └─ ModB_english.txt        ← MCM 菜单汉化（同名覆盖）
+├─ Scripts/
+│  └─ ...pex                  ← 脚本里的界面文字（松散文件覆盖 BSA 内同名脚本；
+│                               来自 BSA 的脚本文件名会是全小写，Windows 不区分大小写）
+├─ ***.bsa                    ← 只有加 --bsa-write 才有：把改过的脚本重打包的归档副本
 ├─ 校对表.csv                 ← 原文/译文对照，可改完再回填
 ├─ 词典.tsv                   ← --tm-export 导出，可复用/分享
 ├─ 质检报告.md / 质检.csv      ← 自动质检结果
@@ -237,6 +259,8 @@ python3 run.py <目录> --fuzzy 0.93              # 开启模糊匹配
 python3 run.py <目录> --only "SkyUI,Ordinator"   # 只翻文件名含关键字的插件
 python3 run.py <目录> --exclude "Test"           # 排除
 python3 run.py <目录> --no-bsa                   # 不解析 BSA（更快）
+python3 run.py <目录> --no-pex                   # 不翻脚本里的界面文字
+python3 run.py <目录> --bsa-write                # 额外把改过的脚本重打包成 BSA
 python3 run.py <目录> --dry-run                  # 不联网，只用缓存/词典走流程
 python3 run.py <目录> --no-check                 # 跳过质检
 python3 run.py <目录> --in-place                 # 直接改原文件（自动存 .orig 备份）
@@ -250,7 +274,8 @@ python3 run.py <目录> -o "D:\汉化2"              # 换输出目录
 **Q：跑完进游戏还是英文？**
 - 汉化包没启用，或被别的 mod 覆盖了 → 把它拖到左侧列表最下方；
 - 内嵌字符串的插件：确保右侧插件列表里勾的是汉化版 `xxx.esp`，且排在后面；
-- 该 mod 的文本在 `.pex` 脚本里 → 翻不了，属已知限制；
+- 该 mod 的文本在 `.pex` 脚本里：确认 `汉化输出/Scripts/` 下有对应脚本；若同时用了
+  `--bsa-write`，注意松散文件优先，两个都在也没关系；
 - MCM 文本没变：确认 `Interface/Translations/xxx_english.txt` 已覆盖。
 
 **Q：中文显示成方块 / 问号？**
@@ -278,7 +303,13 @@ python3 run.py <目录> -o "D:\汉化2"              # 换输出目录
 
 ## 14. 已知限制
 
-- Papyrus 脚本内写死的字符串无法翻译（xTranslator 有 pex 反编译翻译，我们暂未实现）。
+- 脚本翻译是**字符串表级**的（和 ESP-ESM Translator 的 .pex 模式同一思路），不是反编译重编译：
+  因此只能翻译「表里已存在的人话」。单个词（如 `Activate`）默认跳过——它多半是状态名或键名，
+  翻了容易被脚本内部比较用到；确实要翻可以改 `pex.py` 里的 `looks_translatable`。
+- 脚本里由 CK 生成的 docstring（比如 `Function that returns the current state`）可能被一起翻译。
+  它只在 Creation Kit 里可见，不影响游戏表现。
+- BSA 回写覆盖 v105（SE/AE）的 LZ4 压缩与不压缩两种；v103/v104 的 zlib 压缩档按规范实现了，
+  但手头没有真实样本做回归，遇到问题会走「自动读回校验」并在报告里报错，不会写坏原档。
 - 少数 mod 用非标准 BSA 变体或加密包，可能读不出 strings（报告里会提示，不影响其他 mod）。
 - 字段白名单基于公开的记录定义整理；极端自定义字段仍可能漏翻（不会误翻，因为我们要求
   「字段在名单里 + 数据是可打印 zstring」双条件）。
@@ -294,7 +325,8 @@ python3 run.py <目录> -o "D:\汉化2"              # 换输出目录
 | 参考 | 学到了什么 | 我们怎么用 |
 |---|---|---|
 | **[xTranslator](https://github.com/MGuffin/xTranslator)**（MPL-2.0） | ① Skyrim 记录定义：`FULL` 全记录通用、`DESC` 是长字符串、`MGEF:DNAM`/`QUST:CNAM`/`ACTI:RNAM` 等特殊字段；② 字段长度参考、枚举文本警告；③ SST 词典 + Alias 校验；④ EspCompare 按 FormID 配对 | 重写了 `fields.py`（修正了旧版把 `ACTI/FLOR/INFO:RNAM` 当资源引用的错误），`qa.py` 的标记校验与超长预警，`tm.py` 的按 ID 配对与插件配对 |
-| **[ESP-ESM Translator](https://www.nexusmods.com/skyrimspecialedition/mods/921)** | 数据库（BDD）思路、「去数字/去标点」的模糊命中、枚举/重复文本一致性 | `tm.py` 的归一化匹配 + 数字回填；质检的「同原文多译法」 |
+| **[ESP-ESM Translator](https://www.nexusmods.com/skyrimspecialedition/mods/921)** | 数据库（BDD）思路、「去数字/去标点」的模糊命中、枚举/重复文本一致性；**直接翻译 `.pex`**、**可写 BSA** | `tm.py` 的归一化匹配 + 数字回填；质检的「同原文多译法」；`pex.py`（字符串表级翻译 + 结构自校验）、`bsa.py` 的回写 |
+| **UESP《Compiled Script File Format》** | Papyrus 3.1/3.2 的完整字节布局：头部三个 wstring、字符串表、调试信息、对象/变量/属性/状态、操作码表 | `pex.py` 的解析与回写依据（用 13 个真实 `.pex` 验证：全部精确解析到文件末尾，原样回写逐字节相同） |
 | **Arcane Translator**（Nexus 上的 AI 翻译前端） | 保留规则（XML/标签/CamelCase/下划线标识符）、术语强制、自我校验、会话续跑 | 占位符/标签保护、术语表注入与兜底、缓存续跑、质检 |
 | **[mTRANSLATOR](https://github.com/starbudweiser/mTRANSLATOR)** | 自学习本地记忆 + 词典优先于机翻 | `tm.sqlite` 跑完自动学习，下次先查词典 |
 | **xEdit / UESP** | TES4/GRUP/XXXX/压缩记录、STRINGS/DLSTRINGS/ILSTRINGS、BSA v105 + LZ4 格式细节 | `esp.py` / `strings.py` / `bsa.py` 的实现依据 |
@@ -317,7 +349,8 @@ tools/skyrim-zh-translator/
 ├─ skytrans/
 │  ├─ esp.py             插件解析/回写（TES4 记录、GRUP、XXXX、压缩记录）
 │  ├─ strings.py         STRINGS/DLSTRINGS/ILSTRINGS
-│  ├─ bsa.py             BSA v103/104/105 只读 + 纯 Python LZ4
+│  ├─ bsa.py             BSA v103/104/105 读取 + 回写重打包 + 纯 Python LZ4（压缩/解压）
+│  ├─ pex.py             Papyrus .pex 字符串表读取 + 回写（结构自校验）
 │  ├─ mcm.py             MCM 翻译文件
 │  ├─ fields.py          记录×字段白名单 + 字段长度参考
 │  ├─ textfilter.py      过滤/占位符保护/长文切分/术语表/记号签名
@@ -328,7 +361,7 @@ tools/skyrim-zh-translator/
 │  ├─ scan.py            目录扫描
 │  ├─ pipeline.py        抽取→词典/缓存→翻译→回写→报告（支持并发）
 │  └─ cli.py             命令行 + 交互向导
-└─ tests/                35 个单元测试
+└─ tests/                61 个单元测试
 ```
 
 ```bash
@@ -336,7 +369,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 覆盖：插件字节级往返、长记录 `XXXX`、压缩记录、字符串表 ID 稳定性、BSA/LZ4、
-词典三级匹配与数字回填、并发、质检各类问题、端到端 mock 流水线。
+BSA 重打包（不压缩/压缩、替换后读回、未知条目拒绝、未替换条目逐字节保留）、
+`.pex` 解析与回写（字节级往返、改长度后结构与表后数据不变）、
+词典三级匹配与数字回填、并发、质检各类问题、端到端 mock 流水线（含脚本与 BSA 重打包）。
 
 ---
 

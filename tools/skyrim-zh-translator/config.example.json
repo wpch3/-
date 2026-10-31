@@ -1,0 +1,13 @@
+{
+  "_说明": "这个文件保存翻译引擎配置。含有 API Key，请勿分享/上传。",
+
+  "provider": "openai",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "api_key": "",
+
+  "batch_chars": 2400,
+  "batch_items": 30,
+  "output_lang": "english",
+  "export_review": true
+}
